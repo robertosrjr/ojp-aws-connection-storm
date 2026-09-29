@@ -5,7 +5,14 @@
 This repository will hold a reproducible proof of concept that answers that question with data.
 
 > **Status: proposal stage.** Nothing has been built or measured yet. We are validating the idea with the OJP community first.
-> 👉 **Read the full proposal: [PROPOSAL.md](PROPOSAL.md)**
+
+## Documents
+
+| Document | What it is | Read it if… |
+|---|---|---|
+| 📄 **[PROPOSAL-SUMMARY.md](PROPOSAL-SUMMARY.md)** | The proposal in about one page: goal, architecture, experiments, open questions | You have 5 minutes. **Start here.** |
+| 📘 **[PROPOSAL.md](PROPOSAL.md)** | Full proposal: hypotheses, design decisions and their rationale, experiments, risks, references | You want to review or challenge the approach |
+| 🛠️ **SDD.md** *(planned, after community approval)* | Software Design Document: detailed specifications for building the PoC (infrastructure, service, configuration, experiments, metrics) | You want to build, reproduce or contribute code |
 
 ---
 
@@ -70,6 +77,7 @@ We will publish every result, including the ones that do not favour OJP. Every c
 | Phase | What | Status |
 |---|---|---|
 | **P0 · Validate** | Proposal reviewed by the OJP community and maintainers | 🟡 In progress |
+| **P0.5 · Specify** | SDD with detailed specifications, based on community feedback | ⚪ After approval |
 | **P1 · Build** | Terraform, settlement service, dashboards, baseline | ⚪ Not started |
 | **P2 · Storm** | Direct vs OJP vs RDS Proxy under spikes and restart storms | ⚪ Not started |
 | **P3 · Chaos** | Node loss, AZ isolation, latency, Aurora failover | ⚪ Not started |
@@ -79,7 +87,8 @@ We will publish every result, including the ones that do not favour OJP. Every c
 
 This is the best moment to influence the design, before any code exists.
 
-- **Read [PROPOSAL.md](PROPOSAL.md)**, especially [§10 Open questions for OJP maintainers](PROPOSAL.md#10-open-questions-for-ojp-maintainers).
+- **Read the [summary](PROPOSAL-SUMMARY.md)**, then the [full proposal](PROPOSAL.md), especially [§10 Open questions for OJP maintainers](PROPOSAL.md#10-open-questions-for-ojp-maintainers).
+- **Approve or challenge the proposal.** The SDD, with the detailed implementation specifications, will be written only after the community agrees on the approach.
 - **Open an issue** to challenge a hypothesis, propose an experiment, or point out something we got wrong.
 - **Share production experience** with OJP, Aurora or connection storms. Real incidents make better experiments.
 
