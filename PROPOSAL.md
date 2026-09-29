@@ -12,6 +12,8 @@
 
 We propose a reproducible proof of concept that runs **three OJP nodes, one per Availability Zone, in front of Aurora PostgreSQL**. The same settlement workload is run under controlled failures and compared against two alternatives: the application connecting **directly** to Aurora, and (optionally) **Amazon RDS Proxy**.
 
+The framing is **OJP as a database control plane**. It separates how far the application can scale from how many connections the database can physically handle.
+
 This PoC does **not** claim that OJP makes the database faster or creates capacity. The claim we want to test is narrower and more useful:
 
 > **When load or failures exceed what the database can absorb, OJP turns a database collapse into bounded, observable load shedding, and recovers without a reconnection storm.**
@@ -73,6 +75,19 @@ Each hypothesis has a pass/fail criterion. A failed hypothesis is still a publis
 | **H4** | Losing one OJP node only affects the sessions bound to that node. The remaining nodes absorb the pool share, and the cluster rebalances on recovery. | Errors limited to in-flight sessions on the lost node. Total DB connections stay ≤ 60. Rebalanced after the node returns. `[DOC]` behaviour, `[HYP]` timings |
 | **H5** | During an Aurora writer failover, OJP prevents a reconnection storm against the new writer. | Connection count on the new writer stays ≤ 60 during recovery. We report time-to-recovery and error count. `[HYP]` |
 | **H6** | When database latency rises, OJP's admission control protects the database and the application degrades predictably. | No DB overload. Load shedding matches the Little's law ceiling (see E4). `[HYP]` |
+
+### The four pillars
+
+For the article and the live session, the hypotheses and experiments are grouped into four pillars:
+
+| Pillar | Question it answers | Experiments |
+|---|---|---|
+| **1 · A/B baseline** | What does OJP change compared with the usual setup, under identical load? | E0, E1 on Arms A, B, C |
+| **2 · Overload protection** | Does admission control (and, separately, Slow Query Segregation) keep the database healthy when demand exceeds capacity? | E1, E4 |
+| **3 · Chaos engineering** | What happens when an OJP node, an AZ or the Aurora writer fails under load? | E2, E3, E5 |
+| **4 · End-to-end observability** | Can we see every effect above from client to database on one screen? | §7, all experiments |
+
+Pillar 2 deliberately tests the thundering herd and Slow Query Segregation **in separate runs**. If both change in one run, we cannot tell which one caused the result.
 
 ---
 
@@ -181,17 +196,82 @@ The PoC sets `ojp.connection.pool.connectionTimeout=2000` so the admission wait 
 
 **Slow Query Segregation** is off by default. We enable it explicitly (`ojp.server.slowQuerySegregation.enabled=true`) for the mixed-load variant in E4. We always write the name out in full: "SQS" would be read as Amazon SQS by an AWS audience.
 
-### 4.6 Private by default
+### 4.6 Secure by default
 
+**Network**
 - No NAT gateway and no public IPs.
-- Operators use **SSM Session Manager**. Grafana is reached through SSM port forwarding.
-- Artifacts (OJP JAR, JDBC driver, JMX exporter, k6 binary, application JAR) are staged in an S3 bucket and reached through the S3 gateway endpoint.
+- Security groups allow only the paths that are needed:
+  - ALB → app on 8080
+  - app → OJP on 1059
+  - OJP → Aurora on 5432
+  - observability → metrics ports
+- On top of the security groups, OJP's own IP allow lists are restricted. `ojp.server.allowedIps` is limited to the app subnets, and `ojp.prometheus.allowedIps` to the observability subnet. Both default to `0.0.0.0/0` `[DOC]`.
+
+**Encryption in transit.** OJP's gRPC is **plaintext by default** `[DOC]`, which is not acceptable for a financial ledger.
+- App → OJP uses **mTLS**, which OJP supports `[DOC]`.
+- OJP → Aurora uses TLS with `sslmode=verify-full`, with the certificates configured on the OJP server `[DOC]`.
+- E0 measures how much TLS costs in latency.
+
+**Encryption at rest.** KMS on the Aurora cluster, EBS encryption by default, SSE on the artifact bucket.
+
+**Identity and access**
+- Operators use **SSM Session Manager**. There is no SSH and no bastion. Grafana is reached through SSM port forwarding.
+- IMDSv2 is required on every instance.
+- Each instance role gets least privilege. Only the app role can read the application secret.
 - Database credentials live in **Secrets Manager** (Aurora-managed master secret plus an application user).
 - CI/CD uses **GitHub Actions with OIDC**, with no long-lived AWS keys. The IAM role's trust policy is scoped to the repository and branch.
+
+**Supply chain.** Artifacts (OJP JAR, JDBC driver, JMX exporter, k6 binary, application JAR) are staged in an S3 bucket with checksums verified and pinned versions. Instances reach it through the S3 gateway endpoint.
+
+**Detection.** CloudTrail and VPC Flow Logs are on. GuardDuty is optional for the PoC.
 
 ### 4.7 Chaos with AWS FIS and guardrails
 
 We use AWS FIS only; Gremlin is not needed. Every experiment template has **stop conditions bound to CloudWatch alarms**, such as an ALB 5xx ratio or Aurora CPU. A running experiment aborts itself if the blast radius exceeds what was planned. The templates are managed in Terraform (`aws_fis_experiment_template`).
+
+### 4.8 Static stability: capacity after losing an AZ
+
+The system must survive losing one AZ **without launching new capacity**. Replacement instances and Route 53 updates restore redundancy afterwards, but availability must not depend on them.
+
+- **Requirement:** 2 OJP nodes and 8 JVMs carry **100% of the steady load (150 tx/s)** with p99 inside the SLO (§7).
+- **Per OJP node:** each surviving node goes from 20 to 30 connections and must have CPU and heap headroom for that.
+- **Checked twice:**
+  - in E0, by running `steady` with one OJP node and one app host removed,
+  - in E2 and E3, under live failure.
+
+### 4.9 Health checks that do not cascade
+
+- The ALB uses a **shallow** health check (`/health/live`) that does not touch the database.
+  - If it went through OJP to Aurora, one database problem would mark **every** target unhealthy at once.
+- A **deep** check (`/health/ready`, app → OJP → `SELECT 1`) feeds alarms and dashboards only.
+- The OJP nodes' ASG health checks use EC2 status plus a local check on the gRPC port.
+
+### 4.10 Operations
+
+- **OJP upgrades** are rolling, one node at a time. Each step is the same event as E2, so E2 also validates the upgrade procedure.
+- **Logs:** app and OJP logs go to CloudWatch Logs with a short retention.
+- **Metric cardinality:** OJP's SQL metrics carry the SQL text as a label `[DOC]`. The workload has fewer than 10 distinct statements, so this is safe here, but we note it as a production concern.
+
+### 4.11 Well-Architected alignment and declared trade-offs
+
+| Pillar | How the design addresses it |
+|---|---|
+| **Reliability** | Multi-AZ; fail fast with bounded queues (admission control); throttling; retries with backoff and jitter; static stability (§4.8); shallow health checks (§4.9); failure testing with FIS |
+| **Security** | Private network; mTLS and TLS in transit; KMS at rest; least-privilege IAM; OIDC; Secrets Manager; IMDSv2; CloudTrail and Flow Logs (§4.6) |
+| **Operational excellence** | Everything as code; runbooks per experiment; game days; SLOs; one dashboard |
+| **Performance efficiency** | Instance choices measured, not assumed; Graviton; open-model load tests |
+| **Cost optimization** | Estimate, budget alarm, `make down`; Graviton; cross-AZ transfer measured |
+| **Sustainability** | Graviton; environment exists only while experiments run |
+
+**Trade-offs we accept on purpose**
+
+- **Cross-AZ routing vs AZ independence.** AWS's Multi-AZ guidance favours keeping traffic within one AZ, so a partial failure there stays contained. OJP's load-aware routing does not consider the AZ, so about 2/3 of calls cross AZs. We accept this, measure it (E0), and ask maintainers about AZ-aware routing (Q5).
+- **Single-AZ test harness.** The load generator and observability run only in AZ-a. They are not part of the system under test, and keeping them out of the failures is the point.
+- **No disaster recovery.**
+  - Aurora automated backups are on, with 7-day retention. That gives point-in-time recovery.
+  - Deletion protection is off so `make down` works.
+  - Multi-region is out of scope, and so are an RTO and RPO for a regional failure.
+- **Aurora Standard storage** rather than I/O-Optimized. Short runs make Standard cheaper. We will report the I/O cost the storms generate.
 
 ---
 
@@ -222,6 +302,12 @@ The same application binary runs in every arm. Only the datasource configuration
 | `restart-storm` | Steady load while all 12 JVMs restart within 5 s |
 | `retry-storm` *(variant)* | `spike` with naive client retries versus exponential backoff with jitter |
 
+All profiles use k6's **open model** (`constant-arrival-rate` / `ramping-arrival-rate`), not a fixed number of virtual users.
+
+- With fixed VUs, each virtual user waits for a response before sending the next request.
+- So when latency rises, the offered load drops by itself, and the storm hides exactly when we want to see it (coordinated omission).
+- In the open model, requests keep arriving at the planned rate no matter how slow the system gets, which is how real traffic behaves.
+
 Each run lasts 10 minutes after a 5-minute warm-up and is repeated **3 times**. We report the median run and the spread.
 
 ---
@@ -235,6 +321,9 @@ The execution order is fixed. Each experiment runs on Arm B, and E0 to E2 also r
 - **Load:** `steady`, 150 tx/s, no faults.
 - **Measure:** p50/p95/p99 latency (client and server side), DB connections, Aurora CPU, OJP connection-acquisition time.
 - **Extra finding to report: cross-AZ traffic.** Load-aware selection does not consider the AZ `[DOC]`, so about 2/3 of JDBC calls should cross AZ boundaries `[HYP]`. We will measure the latency and data-transfer cost this adds.
+- **Variant E0-TLS:** the same run with plaintext and with mTLS + TLS, to report what encryption costs in latency.
+- **Variant E0-N-1:** the same run with one OJP node and one app host removed, to verify the capacity requirement in §4.8.
+- **Output:** the SLO targets (§7) are fixed from this run, before any storm or chaos experiment.
 
 ### E1 · Thundering herd (H2, H3)
 
@@ -311,14 +400,21 @@ All metrics go to one Grafana dashboard, which is exported as JSON in the reposi
 | **Tracing** | End-to-end spans: app → OJP → SQL | OJP OTLP exporter (`ojp.tracing.enabled=true`, sample rate 0.1) → Jaeger |
 | **Experiment markers** | FIS start and stop shown as Grafana annotations | EventBridge → annotation script |
 
-Prometheus discovers OJP nodes through `ec2_sd_configs` filtered by tag, so a replaced node is picked up automatically.
+Prometheus discovers OJP nodes through `ec2_sd_configs` filtered by tag, so a replaced node is picked up automatically. App and OJP logs go to CloudWatch Logs.
+
+**SLOs (steady state).** They are fixed from E0, before any storm or chaos run, so they cannot be tuned after seeing the results:
+
+- **Success rate:** ≥ 99.9% of transfers commit.
+- **Latency:** p99 ≤ 1.5 × the E0 p99 of the Direct arm.
+
+During experiments we report how much of the error budget each failure consumed and how long the system took to return inside the SLO.
 
 ---
 
 ## 8. Deliverables
 
 ```
-ojp-aws-storm-poc/
+ojp-aws-connection-storm/
 ├── PROPOSAL.md                  # this document
 ├── README.md                    # quick start: make artifacts → make up → make run E1 → make down
 ├── terraform/
@@ -367,11 +463,23 @@ ojp-aws-storm-poc/
 - **Everything running:** 2 × `db.r7g.large`, 3 × `c7g.large` (OJP), 3 × `c7g.large` (app), 1 × `c7g.xlarge` (k6), 1 observability host, internal ALB, VPC interface endpoints. Expected on the order of **US$ 1.5–2 per hour** on-demand in us-east-1, plus data transfer.
 - **A full experiment day** (about 6 hours) is expected to stay **below US$ 15**.
 - `make down` destroys everything. A budget alarm is part of the Terraform.
+- **Known cost drivers:**
+  - the VPC interface endpoints (charged per AZ per hour; chosen over a NAT gateway for security),
+  - cross-AZ data transfer,
+  - Aurora I/O during storms (Standard storage).
+- **The resources can be counted, but not priced from here.** The per-hour total must be confirmed in the [AWS Pricing Calculator](https://calculator.aws/) for the chosen region.
 
-### Live demo format
+### Live session agenda (60 min)
 
-- **Pre-recorded:** the A/B storm (E1). It needs several repetitions to be credible and is not a good fit for a live run.
-- **Live:** E2 (kill an OJP node) and E5a (Aurora failover), triggered from the FIS console with the Grafana dashboard on screen.
+| Time | Block | Content |
+|---|---|---|
+| 5 min | **The problem** | Connection storms in microservice fleets. Why per-instance pools do not scale with the database. |
+| 10 min | **Architecture** | Three OJP nodes across AZs. Why there is no load balancer in front of OJP. How the pool is divided. Why the proxy tier does not autoscale. |
+| 15 min | **A/B results** *(pre-recorded)* | Direct vs OJP vs RDS Proxy under spike and restart storm, with the data from 3 runs. Wins and losses both shown. |
+| 15 min | **Live chaos** | E2 (kill an OJP node) and E5a (Aurora failover), triggered from the FIS console with the Grafana dashboard on screen. |
+| 15 min | **Q&A** | Open questions, the answers from maintainers, and the repository. |
+
+- **Why the A/B is pre-recorded:** it needs several repetitions to be credible, and one live run proves nothing.
 - **Safety:** each live experiment has an abort button (stop the FIS experiment) and a fallback recording.
 
 ---
@@ -402,6 +510,9 @@ These are the answers we need before P1. Some of them may become upstream issues
 | Cost overrun | Budget alarm, `make down`, runs scheduled in blocks |
 | Live demo fails | Pre-recorded fallback for every live experiment; FIS stop conditions |
 | OJP version drift during the project | Pin `1.0.0` for all runs; re-run E0 before publishing if a patch release lands |
+| Sensitive data in transit | mTLS app → OJP, TLS OJP → Aurora; the workload uses synthetic accounts only |
+| The TLS setup behaves differently from plaintext under storms | E0-TLS establishes the baseline; E1 runs with TLS on, as it would in production |
+| The test harness fails during an experiment | The harness lives in AZ-a, which is never the failed AZ; FIS stop conditions |
 
 ---
 
@@ -409,7 +520,7 @@ These are the answers we need before P1. Some of them may become upstream issues
 
 - **XA / distributed transactions.** A different story, possibly a follow-up PoC.
 - **Read/write splitting** to the Aurora reader. OJP supports it `[DOC]`, but it adds variables that would blur this experiment.
-- **Multi-region and Aurora Global Database.**
+- **Multi-region, Aurora Global Database and disaster recovery** (see the trade-offs in §4.11).
 - **Kubernetes/EKS.** This PoC stays on EC2 to keep the moving parts visible.
 - **Autoscaling the OJP tier.** It does not fit the current design (see §4.2).
 
@@ -417,23 +528,12 @@ These are the answers we need before P1. Some of them may become upstream issues
 
 ## 13. References
 
-**OJP**
-- Repository: https://github.com/Open-J-Proxy/ojp
-- Multinode guide: https://github.com/Open-J-Proxy/ojp/blob/main/documents/multinode/README.md
-- Server configuration: https://github.com/Open-J-Proxy/ojp/blob/main/documents/configuration/ojp-server-configuration.md
-- JDBC client configuration: https://github.com/Open-J-Proxy/ojp/blob/main/documents/configuration/ojp-jdbc-configuration.md
-- Telemetry: https://github.com/Open-J-Proxy/ojp/blob/main/documents/telemetry/README.md
-- Admission control and backpressure: https://github.com/Open-J-Proxy/ojp/blob/main/documents/analysis/ADMISSION_CONTROL_BACKPRESSURE_SUMMARY.md
-- Spring Boot starter: https://github.com/Open-J-Proxy/ojp/blob/main/documents/java-frameworks/spring-boot/README.md
-- `ConnectionHashGenerator.java`: https://github.com/Open-J-Proxy/ojp/blob/main/ojp-server/src/main/java/org/openjproxy/grpc/server/utils/ConnectionHashGenerator.java
-- `DatabaseUtils.java`: https://github.com/Open-J-Proxy/ojp/blob/main/ojp-grpc-commons/src/main/java/org/openjproxy/database/DatabaseUtils.java
-- Docker image tags: https://hub.docker.com/r/rrobetti/ojp/tags
-- *Open J Proxy 1.0.0: Ready for Production* (JAVAPRO): https://javapro.io/2026/09/24/open-j-proxy-1-0-0-ready-for-production/
+The full list of references, grouped by component and saying what each one supports, is in **[REFERENCES.md](REFERENCES.md)**. The most important ones:
 
-**AWS**
-- FIS actions reference: https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html
-- FIS SSM documents (`AWSFIS-Run-Network-Latency-Sources`): https://docs.aws.amazon.com/fis/latest/userguide/actions-ssm-agent.html
-- RDS Proxy for Aurora: https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/rds-proxy.html
+- **OJP:** [multinode guide](https://github.com/Open-J-Proxy/ojp/blob/main/documents/multinode/README.md) · [server configuration](https://github.com/Open-J-Proxy/ojp/blob/main/documents/configuration/ojp-server-configuration.md) · [client configuration](https://github.com/Open-J-Proxy/ojp/blob/main/documents/configuration/ojp-jdbc-configuration.md) · [admission control](https://github.com/Open-J-Proxy/ojp/blob/main/documents/analysis/ADMISSION_CONTROL_BACKPRESSURE_SUMMARY.md) · [telemetry](https://github.com/Open-J-Proxy/ojp/blob/main/documents/telemetry/README.md) · [mTLS](https://github.com/Open-J-Proxy/ojp/blob/main/documents/configuration/mtls-configuration-guide.md)
+- **Aurora:** [fast failover with Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.BestPractices.FastFailover.html) · [cluster endpoints](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Endpoints.Cluster.html) · [RDS Proxy](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/rds-proxy.html)
+- **Chaos:** [FIS actions reference](https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html) · [FIS SSM documents](https://docs.aws.amazon.com/fis/latest/userguide/actions-ssm-agent.html) · [stop conditions](https://docs.aws.amazon.com/fis/latest/userguide/stop-conditions.html)
+- **Architecture:** [Well-Architected pillars](https://docs.aws.amazon.com/wellarchitected/latest/framework/the-pillars-of-the-framework.html) · [Advanced Multi-AZ Resilience Patterns](https://docs.aws.amazon.com/whitepapers/latest/advanced-multi-az-resilience-patterns/advanced-multi-az-resilience-patterns.html) · [Financial Services Industry Lens](https://docs.aws.amazon.com/wellarchitected/latest/financial-services-industry-lens/financial-services-industry-lens.html)
 
 ---
 

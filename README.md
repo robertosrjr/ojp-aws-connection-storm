@@ -12,6 +12,7 @@ This repository will hold a reproducible proof of concept that answers that ques
 |---|---|---|
 | 📄 **[PROPOSAL-SUMMARY.md](PROPOSAL-SUMMARY.md)** | The proposal in about one page: goal, architecture, experiments, open questions | You have 5 minutes. **Start here.** |
 | 📘 **[PROPOSAL.md](PROPOSAL.md)** | Full proposal: hypotheses, design decisions and their rationale, experiments, risks, references | You want to review or challenge the approach |
+| 🔗 **[REFERENCES.md](REFERENCES.md)** | Official documentation for every component (OJP, AWS, tooling), with what each reference supports | You want to check a claim at its source |
 | 🛠️ **SDD.md** *(planned, after community approval)* | Software Design Document: detailed specifications for building the PoC (infrastructure, service, configuration, experiments, metrics) | You want to build, reproduce or contribute code |
 
 ---
